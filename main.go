@@ -16,9 +16,7 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"os"
-	"os/signal"
 	"strings"
 	"time"
 
@@ -26,6 +24,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"github.com/spheromak/vici-proxy/internal/proxy"
 )
 
 const (
@@ -34,51 +33,57 @@ const (
 	// ShutdownGrace is the timeout waiting for server to shutdown
 	ShutdownGrace = 5 * time.Second
 
-	// viciSocketTimeout is the time to wait connecting to charon.vici
-	viciSocketTimeout = 500 * time.Millisecond
+	defaultListenSocket = "/var/run/proxy.vici"
+	defaultViciSocket   = "/var/run/charon.vici"
 )
 
 func main() {
 	configure()
 
-	log.Info().Msg("Proxy starting")
+	p, err := proxy.New(
+		viper.GetString("vici-socket"),
+		viper.GetString("listen-socket"),
+		viper.GetStringSlice("allow"),
+	)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Could not start proxy")
+	}
+	log.Error().Err(p.Start()).Msg("shutdown")
 
-	// sertup a signal handler ctx
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-	ctx, cancel := context.WithTimeout(context.Background(), ShutdownGrace)
-	log.Ctx(ctx).Info().Msg("Server Shutting down")
+	/*
+		// sertup a signal handler ctx
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, os.Interrupt)
+		<-quit
+		ctx, cancel := context.WithTimeout(context.Background(), ShutdownGrace)
+		log.Ctx(ctx).Info().Msg("Server Shutting down")
 
-	defer cancel()
-	//	if err := srv.Shutdown(ctx); err != nil {
-	//		log.Fatal().Err(err).Msgf("Server forced to shutdown after %d seconds\n", ShutdownGrace)
-	//	}
-	log.Info().Msg("Server Exited")
+		defer cancel()
+		if err := p.Shutdown(ctx); err != nil {
+			log.Fatal().Err(err).Msgf("Server forced to shutdown after %d seconds\n", ShutdownGrace)
+		}
+		log.Info().Msg("Server Exited")
+	*/
 }
 
 // sets up our cli args and config parsing. Fatal if it can't do these things.
 func configure() {
-	// setup viper:  env/config loading
-	viper.SetConfigName("." + appName)                     // name of config file (without extension)
-	viper.AddConfigPath(".")                               // cwd is highest (preferred) config path
-	viper.AddConfigPath("$HOME")                           // home directory as second search path
+	// setup viper:  env loading
 	viper.SetEnvPrefix(strings.ToUpper(appName))           // environment variable prefix
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_")) // convert environment variable keys from - to _
 	viper.AutomaticEnv()                                   // read in environment variables that match
 
-	if err := viper.ReadInConfig(); err != nil {
-		log.Fatal().Err(err).Msg("couldn't load config")
-	}
-
 	// Parse cli flags and load into viper
-	fs := pflag.NewFlagSet("default", pflag.ExitOnError)
-	fs.Bool("debug", false, "Enable debug logging.")
+	flags := pflag.NewFlagSet("default", pflag.ExitOnError)
+	flags.Bool("debug", false, "Enable debug logging.")
+	flags.StringSliceP("allow", "a", proxy.DefaultAllowed, "Allowed commands.")
+	flags.StringP("vici-socket", "v", defaultViciSocket, "Path to the charon.vici socket.")
+	flags.StringP("listen-socket", "l", defaultListenSocket, "Path to the socket we will listen on.")
 
-	if err := fs.Parse(os.Args); err != nil {
+	if err := flags.Parse(os.Args); err != nil {
 		log.Fatal().Err(err).Msg("couldn't parse flags ")
 	}
-	fs.VisitAll(func(f *pflag.Flag) {
+	flags.VisitAll(func(f *pflag.Flag) {
 		if err := viper.BindPFlag(f.Name, f); err != nil {
 			log.Fatal().Err(err).Msg("couldn't bind flags ")
 		}
