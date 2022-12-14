@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -17,57 +16,48 @@ const (
 
 // ViciBackend is the vici socket implementation of the proxy interface
 type ViciBackend struct {
-	socket string
-	mu     sync.Mutex
+	socket   string
+	mu       sync.Mutex
+	conn     net.Conn
+	attempts int
 }
 
 // the vici socket should be a single read/writer session. Mutex is held inisde the session.
-func (b *ViciBackend) Connect() (error, net.Conn) {
+// The mutex is released when the backend.Close() method is invoked
+func (b *ViciBackend) Connect() (net.Conn, error) {
+	// WE lock here to make  this backend be exclusively 1 connection at a time.
+	// you have to explicitly unlock on error as there is no defer.
+	b.mu.Lock()
+	if b.attempts > 0 {
+		dur := DefaultBackOff.Duration(b.attempts)
+		log.Warn().Msgf("Backing off %s due to '%d' failed backend attempts", dur, b.attempts)
+		time.Sleep(dur)
+	}
+
 	dialer := &net.Dialer{Timeout: viciSocketTimeout}
 	conn, err := dialer.Dial("unix", b.socket)
 	if err != nil {
-		return err, conn
+		// increment backoff and unlock
+		b.attempts++
+		b.mu.Unlock()
+		return conn, err
 	}
 
 	if err != nil {
-		return fmt.Errorf("Failed to connect to charon socket: %w", err), conn
+		// increment backoff and unlock
+		b.attempts++
+		b.mu.Unlock()
+		return conn, fmt.Errorf("Failed to connect to charon socket: %w", err)
 	}
 
-	return nil, conn
+	// for now we hold the pointer to the connection and we lock so that
+	b.conn = conn
+	// reset the backoff
+	b.attempts = 0
+	return conn, err
 }
 
-func (b *ViciBackend) Lock() {
-	// b.mu.Lock()
-}
-
-func (b *ViciBackend) Unlock() {
-	//b.mu.Unlock()
-}
-
-// Send a msg to the backend and proxy respons to the clinet connection
-func (b *ViciBackend) ProxyRaw(client io.Writer, msg []byte) error {
-	err, conn := b.Connect()
-	if err != nil {
-		log.Debug().Err(err).Msg("Couldn't connect to backend")
-		return err
-	}
-	defer conn.Close()
-
-	log.Debug().Msg("Connecting response stream to client")
-	// proxy response back to client
-	go func() error {
-		if i, err := io.Copy(client, conn); err != nil {
-			log.Debug().Err(err).Msgf("couldn't send to client wrote: %d bytes", i)
-			return err
-		}
-		return nil
-	}()
-
-	log.Debug().Msg("Sending request to backend")
-	if _, err := conn.Write(msg); err != nil {
-		log.Debug().Err(err).Msg("couldn't send to backend")
-		return err
-	}
-
-	return nil
+func (b *ViciBackend) Close() {
+	b.conn.Close()
+	b.mu.Unlock()
 }

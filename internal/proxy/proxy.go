@@ -31,10 +31,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -85,17 +88,28 @@ func New(vici, listen string, allowed []string) (*Proxy, error) {
 
 // limited implementation of reading client commands based on the vici spec/doc:
 // https://www.strongswan.org/apidoc/md_src_libcharon_plugins_vici_README.html
-func (p *Proxy) Start() error {
+func (p *Proxy) Start(ctx context.Context) error {
 	listener, err := net.Listen("unix", p.listenSocket)
 	if err != nil {
 		return fmt.Errorf("Error starting socket server at '%s' %w", p.listenSocket, err)
 	}
 
+	// shutdown and cleanup listener when cancelled
+	go func(ctx context.Context) {
+		<-ctx.Done()
+		log.Info().Msg("Shutting down listener")
+		listener.Close()
+		err := os.Remove(p.listenSocket)
+		if err != nil {
+			log.Error().Err(err).Msgf("failed to remove server socket at %s", p.listenSocket)
+		}
+	}(ctx)
+
 	log.Info().Str("listening", p.listenSocket).Msg("listener started")
 	// begin connection serving loop
 	id := 0
-	for {
 
+	for {
 		client, err := listener.Accept()
 		if err != nil {
 			log.Debug().Err(err).Msg("error accepting conneciton")
@@ -114,10 +128,22 @@ func (p *Proxy) Start() error {
 			continue
 		}
 
-		// handle the connection
-		p.ClientHandler(client, id)
-		p.backend.Unlock()
+		// handle the connections Serially
+		// currently we only allow a serial connection since the intent here is one consumer
+
+		// connect to backend
+		// TODO(Jesse): right now this is a connection per client request. We could/should move this to the backend
+		backend, err := p.backend.Connect()
+		if err != nil {
+			l.Error().Err(err).Msg("couldn't connect to vici socket")
+			continue
+		}
+
+		// not this is serial connection handling atm. we could put this in goroutines, but atm the backend onlly allows one connection
+		p.ClientHandler(ctx, client, backend, id)
+		p.backend.Close()
 	}
+
 }
 
 // validator should shuffle bytes into a buffer after it has read them and validated they are ok
@@ -174,9 +200,8 @@ func (p *Proxy) vaildateClientCommand(client io.Reader, msg io.WriteCloser, id i
 }
 
 // ClientHandler manages a client connection to the proxy
-func (p *Proxy) ClientHandler(client net.Conn, id int) {
+func (p *Proxy) ClientHandler(ctx context.Context, client net.Conn, backend net.Conn, id int) {
 	l := log.With().Int("client", id).Logger()
-	var backend net.Conn
 	var closer sync.Once
 
 	// make sure connections get closed
@@ -184,15 +209,6 @@ func (p *Proxy) ClientHandler(client net.Conn, id int) {
 		l.Debug().Msg("Connection closed from client handler.")
 		_ = client.Close()
 		_ = backend.Close()
-	}
-
-	// connect to backend
-	err, backend := p.backend.Connect()
-	if err != nil {
-		l.Error().Err(err).Msg("couldn't connect to vici socket")
-		p.backend.Unlock()
-		closer.Do(closeFunc)
-		return
 	}
 
 	// handleBackend will process the response data from the backend and tee it to the teminal and to the client connection
@@ -205,10 +221,10 @@ func (p *Proxy) ClientHandler(client net.Conn, id int) {
 	// create a pipe that such that anything pushed on tee is written to the backend and the Teedumper
 	r, w := io.Pipe()
 	tee := io.MultiWriter(backend, w)
-	go dumpData(r, "Client", id)
+	go snoop(r, "Client", id)
 
 	// write the good message to the console dumper and the backend
-	_, err = io.Copy(tee, validR)
+	_, err := io.Copy(tee, validR)
 	//	_, err = io.Copy(tee, client)
 	if err != nil && err != io.EOF {
 		l.Debug().Err(err).Msg("bad Copy to client")
@@ -238,7 +254,7 @@ func (p *Proxy) handleBackendMessage(backend, client net.Conn, id int, closer *s
 	// Connect the client to the pipe writer.  So that it gets data back.
 	tee := io.MultiWriter(client, w)
 	// Peek any data coming out of the server
-	go dumpData(r, "Backend", id)
+	go snoop(r, "Backend", id)
 	// Start pumping bytes from the backend to the tee and the pipe which is the client and the dumper.
 	_, err := io.Copy(tee, backend)
 
@@ -253,17 +269,25 @@ func (p *Proxy) handleBackendMessage(backend, client net.Conn, id int, closer *s
 	closer.Do(closeFunc)
 }
 
-func dumpData(r io.Reader, source string, id int) {
+func snoop(r io.Reader, source string, id int) {
+	// if we aren't debugging then we just discard the bytes int the reader
+	if !viper.GetBool("debug") {
+		_, _ = io.ReadAll(r)
+		return
+	}
+
+	// We are debug so snoop both sides of comms
 	data := make([]byte, 512)
+
+	consoleLog := log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	for {
 		n, err := r.Read(data)
 		if err != nil && err != io.EOF {
-			log.Info().Err(err).Msg("unable to read data")
+			log.Error().Err(err).Msg("unable to read in dumper")
 			return
 		}
 		if n > 0 {
-			fmt.Printf("From %s [%d]:\n", source, id)
-			fmt.Println(hex.Dump(data[:n]))
+			consoleLog.Debug().Msgf("From %s [%d]:\n%s", source, id, hex.Dump(data[:n]))
 		}
 		if n <= 0 {
 			return

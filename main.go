@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,8 +16,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,11 +33,11 @@ import (
 const (
 	appName = "vici-proxy"
 
-	// ShutdownGrace is the timeout waiting for server to shutdown
-	ShutdownGrace = 5 * time.Second
-
 	defaultListenSocket = "/var/run/proxy.vici"
 	defaultViciSocket   = "/var/run/charon.vici"
+
+	// 2 second grace to shutdown
+	ShutdownGrace = time.Second * 2
 )
 
 func main() {
@@ -48,22 +51,24 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Could not start proxy")
 	}
-	log.Error().Err(p.Start()).Msg("shutdown")
 
-	/*
-		// sertup a signal handler ctx
-		quit := make(chan os.Signal, 1)
-		signal.Notify(quit, os.Interrupt)
-		<-quit
-		ctx, cancel := context.WithTimeout(context.Background(), ShutdownGrace)
-		log.Ctx(ctx).Info().Msg("Server Shutting down")
+	// sertup the shutdown signal handler ctx
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		sig := <-quit
+		log.Ctx(ctx).Info().Msgf("Signal '%s' caught, Server Shutting down", sig)
+		cancel()
+		time.Sleep(ShutdownGrace)
+	}()
 
-		defer cancel()
-		if err := p.Shutdown(ctx); err != nil {
-			log.Fatal().Err(err).Msgf("Server forced to shutdown after %d seconds\n", ShutdownGrace)
-		}
-		log.Info().Msg("Server Exited")
-	*/
+	log.Error().Err(p.Start(ctx)).Msg("shutdown")
+	if err != nil {
+		log.Error().Err(err).Msg("Server errr during shutdown")
+	}
+
+	log.Info().Msg("Server Exited")
 }
 
 // sets up our cli args and config parsing. Fatal if it can't do these things.
