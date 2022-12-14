@@ -73,7 +73,7 @@ func New(vici, listen string, allowed []string) (*Proxy, error) {
 	p := &Proxy{
 		backend:      &ViciBackend{socket: vici},
 		listenSocket: listen,
-		allow:        DefaultAllowed,
+		allow:        allowed,
 		timeout:      proxyTimeout,
 	}
 
@@ -195,6 +195,8 @@ func (p *Proxy) vaildateClientCommand(client io.Reader, msg io.WriteCloser, id i
 		}
 		if !allowed {
 			l.Warn().Str("Command", pkt.Name).Msg("Command not allowed")
+			msg.Close()
+			return
 		}
 	}
 }

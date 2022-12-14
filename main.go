@@ -61,14 +61,18 @@ func main() {
 		log.Ctx(ctx).Info().Msgf("Signal '%s' caught, Server Shutting down", sig)
 		cancel()
 		time.Sleep(ShutdownGrace)
+		os.Exit(0)
 	}()
 
 	log.Error().Err(p.Start(ctx)).Msg("shutdown")
 	if err != nil {
 		log.Error().Err(err).Msg("Server errr during shutdown")
+		os.Exit(1)
 	}
 
+	// in theory we shouldn't get here.
 	log.Info().Msg("Server Exited")
+	time.Sleep(ShutdownGrace)
 }
 
 // sets up our cli args and config parsing. Fatal if it can't do these things.
@@ -96,6 +100,8 @@ func configure() {
 
 	// setup the logger
 	setupLogging()
+
+	log.Debug().Msgf("Allow list: %+v", viper.GetStringSlice("allow"))
 }
 
 // set defaults and level for logging
